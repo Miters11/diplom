@@ -55,7 +55,7 @@ func init() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
         owner TEXT,
-        data BLOB
+        data LONGBLOB
     )`)
 	if err != nil {
 		fmt.Println("Error creating files table:", err)
