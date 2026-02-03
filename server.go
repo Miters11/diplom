@@ -1,13 +1,11 @@
 package main
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
 	"database/sql"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -19,16 +17,15 @@ import (
 )
 
 type User struct {
-	ID         int
-	Username   string
-	Password   string
-	Role       string
-	PrivateKey *rsa.PrivateKey
-	PublicKey  *rsa.PublicKey
+	ID       int
+	Username string
+	Password string
+	Role     string
 }
 
 var db *sql.DB
 
+// подключение к базе данных
 func init() {
 	var err error
 	db, err = sql.Open("sqlite", "./cloud.db")
@@ -37,14 +34,12 @@ func init() {
 		panic(err)
 	}
 	fmt.Println("DB opened successfully")
-
+	// создание новой базы данных, если сервер запускается в первый раз
 	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE,
         password TEXT,
-        role TEXT,
-        private_key BLOB,
-        public_key BLOB
+        role TEXT
     )`)
 	if err != nil {
 		fmt.Println("Error creating users table:", err)
@@ -55,7 +50,7 @@ func init() {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         name TEXT,
         owner TEXT,
-        data BLOB
+        data LONGBLOB
     )`)
 	if err != nil {
 		fmt.Println("Error creating files table:", err)
@@ -64,37 +59,34 @@ func init() {
 	fmt.Println("Tables created successfully")
 }
 
+// получение хэша из парола
 func hashPassword(password string) string {
 	hashed, _ := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	return string(hashed)
 }
 
+// сверка хэшей
 func checkPassword(hashed, password string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hashed), []byte(password)) == nil
 }
 
+// регистрация новых пользователей
 func register(c *gin.Context) {
 	username := c.PostForm("username")
 	password := c.PostForm("password")
 	role := c.PostForm("role")
 
-	privateKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-	publicKey := &privateKey.PublicKey
-
-	privateKeyBytes, _ := json.Marshal(privateKey)
-	publicKeyBytes, _ := json.Marshal(publicKey)
-
 	hashedPassword := hashPassword(password)
-	_, err := db.Exec("INSERT INTO users (username, password, role, private_key, public_key) VALUES (?, ?, ?, ?, ?)",
-		username, hashedPassword, role, privateKeyBytes, publicKeyBytes)
+	_, err := db.Exec("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", username, hashedPassword, role)
 	if err != nil {
 		c.JSON(400, gin.H{"error": "User exists"})
 		return
 	}
 
-	c.JSON(200, gin.H{"message": "Registered", "private_key": privateKeyBytes})
+	c.JSON(200, gin.H{"message": "Registered"})
 }
 
+// авторизация
 func login(c *gin.Context) {
 	var loginData struct {
 		Username string `json:"username"`
@@ -106,19 +98,16 @@ func login(c *gin.Context) {
 	}
 
 	var hashedPassword string
-	var privateKeyBytes []byte
 	var role string
-	err := db.QueryRow("SELECT password, private_key, role FROM users WHERE username = ?", loginData.Username).Scan(&hashedPassword, &privateKeyBytes, &role)
+	err := db.QueryRow("SELECT password, role FROM users WHERE username = ?", loginData.Username).Scan(&hashedPassword, &role)
 	if err != nil || !checkPassword(hashedPassword, loginData.Password) {
 		c.JSON(401, gin.H{"error": "Invalid credentials"})
 		return
 	}
-
-	var privateKey rsa.PrivateKey
-	json.Unmarshal(privateKeyBytes, &privateKey)
-	c.JSON(200, gin.H{"message": "Logged in", "private_key": privateKey, "role": role})
+	c.JSON(200, gin.H{"message": "Logged in", "role": role})
 }
 
+// сохранение файла на диске
 func upload(c *gin.Context) {
 	username := c.Query("username")
 	encodedFilename := c.Query("filename")
@@ -159,6 +148,7 @@ func upload(c *gin.Context) {
 	c.JSON(200, gin.H{"id": fmt.Sprintf("%d", id)})
 }
 
+// скачивание файла с диска
 func download(c *gin.Context) {
 	id := c.Param("id")
 	username := c.Query("username")
@@ -184,6 +174,7 @@ func download(c *gin.Context) {
 	c.Data(200, "application/octet-stream", data)
 }
 
+// функция для вывода списка файлов пользователя
 func listfiles(c *gin.Context) {
 	username := c.Query("username")
 	if username == "" {
@@ -215,6 +206,7 @@ func listfiles(c *gin.Context) {
 	c.JSON(200, files)
 }
 
+// создание пользователей
 func createUser(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if !checkAdminAuth(authHeader) {
@@ -224,21 +216,16 @@ func createUser(c *gin.Context) {
 	username := c.PostForm("username")
 	password := c.PostForm("password")
 	role := c.PostForm("role")
-	fmt.Println("Received: username =", username, "password =", password, "role =", role) // Лог полученных данных
+	fmt.Println("Received: username =", username, "password =", password, "role =", role)
 	if username == "" || password == "" || role == "" {
 		fmt.Println("Empty fields")
 		c.JSON(400, gin.H{"error": "Empty fields"})
 		return
 	}
-	privateKey, _ := rsa.GenerateKey(rand.Reader, 2048)
-	publicKey := &privateKey.PublicKey
-	privateKeyBytes, _ := json.Marshal(privateKey)
-	publicKeyBytes, _ := json.Marshal(publicKey)
 	hashedPassword := hashPassword(password)
-	_, err := db.Exec("INSERT INTO users (username, password, role, private_key, public_key) VALUES (?, ?, ?, ?, ?)",
-		username, hashedPassword, role, privateKeyBytes, publicKeyBytes)
+	_, err := db.Exec("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", username, hashedPassword, role)
 	if err != nil {
-		fmt.Println("DB error:", err) // Лог ошибки БД
+		fmt.Println("DB error:", err)
 		c.JSON(400, gin.H{"error": "User exists or DB error"})
 		return
 	}
@@ -246,6 +233,7 @@ func createUser(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "User created"})
 }
 
+// список пользователей
 func listUsers(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if !checkAdminAuth(authHeader) {
@@ -270,6 +258,7 @@ func listUsers(c *gin.Context) {
 	c.JSON(200, users)
 }
 
+// смена пароля пользователя
 func updateUser(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if !checkAdminAuth(authHeader) {
@@ -290,6 +279,7 @@ func updateUser(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "Password updated"})
 }
 
+// удаление пользователей
 func deleteUser(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if !checkAdminAuth(authHeader) {
@@ -307,6 +297,7 @@ func deleteUser(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "User deleted"})
 }
 
+// создание резервной копии
 func backupDB(c *gin.Context) {
 	authHeader := c.GetHeader("Authorization")
 	if !checkAdminAuth(authHeader) {
@@ -336,37 +327,7 @@ func backupDB(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "Backup created", "path": backupPath})
 }
 
-func switchDB(c *gin.Context) {
-	authHeader := c.GetHeader("Authorization")
-	if !checkAdminAuth(authHeader) {
-		c.JSON(401, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	backupPath := c.PostForm("path")
-	if backupPath == "" {
-		c.JSON(400, gin.H{"error": "Path required"})
-		return
-	}
-
-	src, err := os.Open(backupPath)
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Switch failed"})
-		return
-	}
-	defer src.Close()
-
-	dst, err := os.Create("./cloud.db")
-	if err != nil {
-		c.JSON(500, gin.H{"error": "Switch failed"})
-		return
-	}
-	defer dst.Close()
-
-	io.Copy(dst, src)
-	c.JSON(200, gin.H{"message": "DB switched"})
-}
-
+// проверка данный авторизации пользователя перед дальнейшими действиями
 func checkBasicAuth(authHeader, expectedUsername string) bool {
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Basic ") {
 		return false
@@ -389,6 +350,7 @@ func checkBasicAuth(authHeader, expectedUsername string) bool {
 	return username == expectedUsername && checkPassword(hashedPassword, parts[1])
 }
 
+// проверка на авторизацию администратора
 func checkAdminAuth(authHeader string) bool {
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Basic ") {
 		return false
@@ -411,6 +373,22 @@ func checkAdminAuth(authHeader string) bool {
 	return role == "admin" && checkPassword(hashedPassword, parts[1])
 }
 
+// вывод ip на котором развернут сервер
+func getLocalIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "127.0.0.1" // fallback
+	}
+	for _, addr := range addrs {
+		if ipnet, ok := addr.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
+			if ipnet.IP.To4() != nil {
+				return ipnet.IP.String()
+			}
+		}
+	}
+	return "127.0.0.1" // fallback if no non-loopback found
+}
+
 func main() {
 	r := gin.Default()
 	r.POST("/register", register)
@@ -426,6 +404,10 @@ func main() {
 	r.POST("/update_user", updateUser)
 	r.POST("/delete_user", deleteUser)
 	r.POST("/backup_db", backupDB)
-	r.POST("/switch_db", switchDB)
+	localIP := getLocalIP()
+	fmt.Printf("🚀 Server starting on https://%s:443\n", localIP)
+	fmt.Printf("🌐 Access via: https://%s:443\n", localIP)
+	fmt.Printf("🔒 TLS certificates: cert.pem, key.pem\n")
+
 	r.RunTLS(":443", "cert.pem", "key.pem")
 }
